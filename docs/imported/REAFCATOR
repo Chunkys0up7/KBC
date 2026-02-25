@@ -1,0 +1,1478 @@
+"""
+KB Procedure Refactoring Tool
+AI-powered conversion of lending procedures to authoring standards.
+"""
+
+import streamlit as st
+import anthropic
+import json
+import yaml
+import re
+import io
+import time
+from datetime import date, datetime
+from typing import Optional
+
+# ─── PAGE CONFIG ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="KB Procedure Refactoring Tool",
+    page_icon="⚙️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={"About": "AI-powered procedure refactoring for Home Lending KB"}
+)
+
+# ─── CUSTOM CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+  /* ── Stage badges ── */
+  .badge {
+    display:inline-flex; align-items:center; gap:5px;
+    padding:3px 11px; border-radius:20px; font-size:11px;
+    font-weight:700; letter-spacing:.4px; margin:2px;
+  }
+  .badge-done   { background:#0d2b0d; color:#4ade80; border:1px solid #166534; }
+  .badge-run    { background:#0d0d2b; color:#818cf8; border:1px solid #3730a3; }
+  .badge-wait   { background:#1a1a1a; color:#777;    border:1px solid #333;    }
+  .badge-error  { background:#2b0d0d; color:#f87171; border:1px solid #991b1b; }
+
+  /* ── Score card ── */
+  .score-card {
+    background:#1e1e2e; border:1px solid #2a2a3a;
+    border-radius:10px; padding:14px 10px; text-align:center;
+  }
+  .score-num { font-size:28px; font-weight:800; line-height:1; }
+  .score-lbl { font-size:11px; color:#888; margin-top:4px; text-transform:uppercase; letter-spacing:.5px; }
+
+  /* ── Tag pills ── */
+  .tag { display:inline-block; padding:2px 10px; border-radius:12px;
+         font-size:11px; margin:2px; background:#0f2040;
+         color:#60a5fa; border:1px solid #1d4ed8; }
+  .tag-reg { background:#1a0f2e; color:#a78bfa; border-color:#6d28d9; }
+  .tag-role { background:#0f2a1a; color:#34d399; border-color:#065f46; }
+
+  /* ── Principle callout ── */
+  .principle {
+    background:#1a1a2e; border-left:3px solid #6366f1;
+    padding:8px 14px; border-radius:0 8px 8px 0; margin:4px 0; font-size:12px; color:#c7c7d9;
+  }
+
+  /* ── Section label ── */
+  .sec-label {
+    font-size:10px; font-weight:700; letter-spacing:1.8px;
+    text-transform:uppercase; color:#555; margin-bottom:6px;
+  }
+
+  /* ── Diff ── */
+  .diff-add { background:#0d2b0d; border-left:3px solid #4ade80; padding:1px 8px; font-size:12px; font-family:monospace; }
+  .diff-rem { background:#2b0d0d; border-left:3px solid #f87171; padding:1px 8px; font-size:12px; font-family:monospace; }
+  .diff-ctx { padding:1px 8px; font-size:12px; font-family:monospace; color:#555; }
+
+  /* ── Hide default chrome ── */
+  #MainMenu, footer { visibility:hidden; }
+
+  /* ── Compact metric ── */
+  [data-testid="metric-container"] { padding:4px 0; }
+
+  /* ── Better file uploader ── */
+  [data-testid="stFileUploader"] {
+    border:2px dashed #333; border-radius:10px; padding:8px;
+  }
+  [data-testid="stFileUploader"]:hover { border-color:#6366f1; }
+
+  /* ── Tab active ── */
+  .stTabs [data-baseweb="tab"][aria-selected="true"] {
+    background: #1a1a2e; border-bottom: 2px solid #6366f1;
+  }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── CONTROLLED VOCABULARY ───────────────────────────────────────────────────────
+CV = {
+    "product": ["purchase", "refinance_rate_term", "refinance_cash_out",
+                 "home_equity_loan", "home_equity_loc", "all"],
+    "loan_type": ["conventional_conforming", "conventional_jumbo", "fha",
+                  "va", "usda", "non_qm", "heloc", "construction", "all"],
+    "stage": ["origination", "processing", "underwriting",
+              "closing", "post_closing", "servicing", "all"],
+    "role": ["loan_officer", "processor", "underwriter", "closer",
+             "post_closing_specialist", "servicer", "compliance_officer", "all"],
+    "content_type": ["procedure", "policy", "reference",
+                     "decision_matrix", "calculator", "training"],
+    "regulatory": ["tila_reg_z", "respa_reg_x", "ecoa_reg_b", "hmda_reg_c",
+                   "qm_atr_rule", "fnma_selling_guide", "fhlmc_seller_guide",
+                   "fha_handbook", "va_lenders_handbook", "usda_rural_handbook",
+                   "cfpb_guidance", "state_regulation"],
+    "topic": [
+        "income", "income_salaried", "income_self_employed", "income_commission",
+        "income_rental", "income_overtime", "income_bonus",
+        "assets", "asset_verification", "gift_funds", "reserves",
+        "credit", "credit_score", "credit_history", "derogatory_credit",
+        "property", "appraisal", "property_eligibility", "ltv",
+        "title", "title_insurance", "title_search",
+        "documentation", "paystub", "w2", "tax_returns", "bank_statements",
+        "employment", "employment_verification", "employment_gap",
+        "underwriting", "dti", "risk_layering", "atr", "qm",
+        "closing", "closing_disclosure", "settlement", "disbursement",
+        "compliance", "ecoa", "hmda", "fair_lending", "adverse_action",
+        "fha_specific", "va_specific", "usda_specific",
+        "calculation", "ratio", "threshold", "eligibility",
+        "escalation", "exception", "override",
+    ]
+}
+
+# ─── SESSION STATE INIT ──────────────────────────────────────────────────────────
+DEFAULTS = {
+    "documents":       {},   # {name: {raw, extracted, analyzed, transformed, metadata, relationships, validated}}
+    "active_doc":      None,
+    "api_key":         "",
+    "pipeline_log":    [],
+    "chat_history":    [],
+    "batch_complete":  0,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ─── UTILITIES ───────────────────────────────────────────────────────────────────
+def get_client() -> Optional[anthropic.Anthropic]:
+    key = st.session_state.api_key or st.secrets.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return None
+    return anthropic.Anthropic(api_key=key)
+
+
+def extract_text(uploaded_file) -> str:
+    """Extract text from docx, pdf, or txt."""
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    if name.endswith(".docx"):
+        import docx as _docx
+        doc = _docx.Document(io.BytesIO(data))
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                style = para.style.name
+                if "Heading 1" in style:
+                    parts.append(f"# {para.text}")
+                elif "Heading 2" in style:
+                    parts.append(f"## {para.text}")
+                elif "Heading 3" in style:
+                    parts.append(f"### {para.text}")
+                else:
+                    parts.append(para.text)
+        for table in doc.tables:
+            parts.append("\n[TABLE]")
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                parts.append(" | ".join(cells))
+        return "\n".join(parts)
+
+    elif name.endswith(".pdf"):
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    else:  # txt / md
+        return data.decode("utf-8", errors="ignore")
+
+
+def stream_claude(client, system: str, user: str, placeholder) -> str:
+    """Stream a Claude response into a Streamlit placeholder, return full text."""
+    full = ""
+    with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            full += chunk
+            placeholder.markdown(full + "▌")
+    placeholder.markdown(full)
+    return full
+
+
+def badge_html(label: str, state: str) -> str:
+    cls = {"done": "badge-done", "run": "badge-run",
+           "wait": "badge-wait", "error": "badge-error"}.get(state, "badge-wait")
+    icons = {"done": "✓", "run": "⟳", "wait": "○", "error": "✕"}
+    return f'<span class="badge {cls}">{icons[state]} {label}</span>'
+
+
+def compute_quality_score(doc: dict) -> dict:
+    """Heuristic quality scores based on transformed content."""
+    md = doc.get("transformed", "")
+    meta = doc.get("metadata", {})
+    scores = {}
+
+    # Structure: heading hierarchy present
+    has_h1 = bool(re.search(r"^# ", md, re.M))
+    has_h2 = bool(re.search(r"^## ", md, re.M))
+    has_yaml = "---" in md[:200]
+    scores["structure"] = int((has_h1 + has_h2 * 2 + has_yaml * 2) / 5 * 100)
+
+    # If/then logic
+    if_count = len(re.findall(r"\bif\b.*:\s*\n", md, re.I))
+    scores["decision_logic"] = min(100, if_count * 20)
+
+    # Regulatory citations
+    reg_count = len(re.findall(r"12 CFR|FNMA|FHLMC|FHA|VA|USDA|Reg [A-Z]", md))
+    scores["regulatory_coverage"] = min(100, reg_count * 15)
+
+    # Metadata completeness
+    required = ["title", "product", "loan_type", "stage", "role",
+                 "content_type", "regulatory_authority", "summary"]
+    filled = sum(1 for f in required if meta.get(f))
+    scores["metadata"] = int(filled / len(required) * 100)
+
+    # Self-contained sections (no "as mentioned above" etc.)
+    back_refs = len(re.findall(r"as (mentioned|described|stated) (above|earlier|previously)", md, re.I))
+    scores["self_contained"] = max(0, 100 - back_refs * 25)
+
+    scores["overall"] = int(sum(scores.values()) / len(scores))
+    return scores
+
+
+# ─── AI STAGE PROMPTS ────────────────────────────────────────────────────────────
+SYSTEM_ANALYST = """You are an expert knowledge architect for a mortgage lending knowledge base.
+Analyze procedures and map their content to the required template structure.
+Be precise, cite source text exactly, and flag missing sections explicitly.
+Output ONLY valid JSON — no preamble, no markdown fences."""
+
+SYSTEM_TRANSFORMER = """You are an expert technical writer specializing in AI-optimized procedure authoring for mortgage lending.
+You apply 10 core authoring principles to transform legacy procedures:
+1. One Procedure = One Discrete Task
+2. Lead with Purpose Statement and Scope  
+3. Use Explicit, Unambiguous Language
+4. Structure with Consistent Headings (H1/H2/H3)
+5. Make Decision Logic Explicit with If/Then Rules
+6. Always State Regulatory Authority
+7. Tag for Product, Loan Type, Lifecycle Stage
+8. Write Self-Contained Sections
+9. Include Worked Examples for Calculations
+10. Version and Date Everything
+
+Output the complete refactored procedure as markdown with YAML frontmatter.
+Include [SME ACTION REQUIRED: <reason>] tags where human review is needed.
+All if/then rules must be on their own lines. All regulatory citations must include CFR section numbers."""
+
+SYSTEM_METADATA = """You are an expert knowledge base taxonomist for mortgage lending.
+Generate precise YAML frontmatter metadata strictly using the controlled vocabulary provided.
+Output ONLY valid YAML — no preamble, no markdown fences, no commentary."""
+
+SYSTEM_RELATIONSHIPS = """You are a knowledge graph engineer for mortgage lending procedures.
+Extract ontological relationships from the procedure content.
+Output ONLY a valid JSON array of relationship triples — no preamble, no markdown fences."""
+
+
+def run_structure_analysis(client, raw_text: str) -> dict:
+    prompt = f"""Analyze this lending procedure and map it to the standard template sections.
+
+SOURCE DOCUMENT:
+{raw_text[:6000]}
+
+Map to these sections: Purpose, Scope, Prerequisites, Procedure Steps, Exceptions, Quality Control, References.
+
+Return JSON:
+{{
+  "document_title": "...",
+  "section_mapping": {{
+    "Purpose": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "Scope": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "Prerequisites": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "Procedure_Steps": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "Exceptions": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "Quality_Control": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}},
+    "References": {{"found": true/false, "confidence": "high/medium/low", "source_quote": "...", "notes": "..."}}
+  }},
+  "unmapped_content": ["..."],
+  "gaps_identified": ["..."],
+  "implicit_decisions": ["..."],
+  "regulatory_mentions": ["..."],
+  "overall_quality": "poor/fair/good",
+  "conversion_complexity": "low/medium/high"
+}}"""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system=SYSTEM_ANALYST,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = response.content[0].text.strip()
+    # Strip any accidental fences
+    text = re.sub(r"^```[a-z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    return json.loads(text)
+
+
+def run_transformation(client, raw_text: str, analysis: dict, placeholder) -> str:
+    gaps = "\n".join(f"- {g}" for g in analysis.get("gaps_identified", []))
+    sme_items = "\n".join(f"- {u}" for u in analysis.get("unmapped_content", []))
+    prompt = f"""Transform this lending procedure to AI-optimized markdown following all 10 authoring principles.
+
+ORIGINAL PROCEDURE:
+{raw_text[:7000]}
+
+STRUCTURE ANALYSIS FINDINGS:
+- Gaps identified: {gaps or 'None'}
+- Unmapped content: {sme_items or 'None'}
+- Implicit decisions to make explicit: {', '.join(analysis.get('implicit_decisions', []))}
+
+REQUIREMENTS:
+1. Open with YAML frontmatter block (use placeholder values — metadata stage fills these properly)
+2. H1 = procedure title, H2 = major sections, H3 = sub-topics
+3. Convert all implied decisions to explicit IF/THEN statements on their own lines
+4. Every threshold/requirement must cite its regulatory source
+5. Every section must be self-contained — no "as described above" references  
+6. Add a worked example for any calculation
+7. Mark missing content: [SME ACTION REQUIRED: <specific reason>]
+8. Add Quality Control checklist at the end
+
+Output the complete refactored markdown document."""
+    return stream_claude(client, SYSTEM_TRANSFORMER, prompt, placeholder)
+
+
+def run_metadata_generation(client, transformed: str, raw_text: str) -> dict:
+    cv_str = json.dumps(CV, indent=2)
+    prompt = f"""Generate complete YAML frontmatter metadata for this lending procedure.
+
+PROCEDURE CONTENT (first 4000 chars):
+{transformed[:4000]}
+
+CONTROLLED VOCABULARY (use ONLY these values):
+{cv_str}
+
+Generate YAML with these fields:
+title: (string — clear, action-oriented)
+procedure_id: (string — PROC-XX-NNNN format, guess dept from content)
+version: "1.0.0"
+status: "draft"
+effective_date: {date.today().isoformat()}
+last_reviewed: {date.today().isoformat()}
+next_review_date: (6 months from today)
+owner: (department — guess from content)
+product: [list from controlled vocab]
+loan_type: [list from controlled vocab]
+stage: [list from controlled vocab]
+role: [list from controlled vocab]
+content_type: (single value from controlled vocab)
+regulatory_authority: [list from controlled vocab]
+topic: [3-8 tags from controlled vocab topic list]
+summary: (≤500 chars, AI-retrieval optimized, include synonyms)
+regulatory_references:
+  - citation: "12 CFR X.XXX"
+    description: "..."
+mismo_references:
+  - container: "INCOME/ASSET/etc"
+    data_point: "FieldName"
+related_procedures: []
+supersedes: null
+sme_action_items: [list of [SME ACTION REQUIRED] items found in content]
+
+Output ONLY valid YAML, no fences, no commentary."""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system=SYSTEM_METADATA,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = response.content[0].text.strip()
+    text = re.sub(r"^```[a-z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    return yaml.safe_load(text)
+
+
+def run_relationship_extraction(client, transformed: str, metadata: dict) -> list:
+    prompt = f"""Extract knowledge graph relationships from this lending procedure.
+
+PROCEDURE: {metadata.get('title', 'Unknown')}
+CONTENT (first 3000 chars):
+{transformed[:3000]}
+
+Extract relationships using these types:
+REQUIRES, GOVERNED_BY, PERFORMED_BY, HAS_THRESHOLD, EXCEPTION_TO, TRIGGERS, REFERENCES, PRECEDES, SUPERSEDES
+
+Return JSON array:
+[
+  {{"subject": "entity_name", "predicate": "RELATIONSHIP_TYPE", "object": "entity_name", "source": "brief quote"}},
+  ...
+]
+
+Extract 5-15 relationships. Include regulatory, role, and procedural relationships."""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=SYSTEM_RELATIONSHIPS,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = response.content[0].text.strip()
+    text = re.sub(r"^```[a-z]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        return []
+
+
+def validate_procedure(transformed: str, metadata: dict) -> dict:
+    issues = []
+    warnings = []
+
+    # Hard checks
+    if not re.search(r"^# ", transformed, re.M):
+        issues.append("Missing H1 title")
+    if "## Purpose" not in transformed and "## Purpose" not in transformed:
+        warnings.append("Purpose section not clearly labeled")
+    if "## Scope" not in transformed:
+        warnings.append("Scope section missing")
+    if not re.search(r"\bif\b.+:\s*\n", transformed, re.I):
+        warnings.append("No explicit if/then decision logic found")
+    if not re.search(r"12 CFR|FNMA|FHLMC|FHA|VA Lenders|Reg [A-Z]", transformed):
+        issues.append("No regulatory citations found")
+    if re.search(r"as (mentioned|described|stated) (above|earlier|previously)", transformed, re.I):
+        issues.append("Back-references found ('as mentioned above' etc.) — sections not self-contained")
+    if len(re.findall(r"\[SME ACTION REQUIRED", transformed)) > 10:
+        warnings.append(f"{len(re.findall(r'[SME ACTION REQUIRED', transformed))} SME action items pending — review before publishing")
+
+    # Metadata checks
+    for req in ["title", "product", "loan_type", "stage", "role", "summary"]:
+        if not metadata.get(req):
+            issues.append(f"Metadata: required field '{req}' is missing")
+    if metadata.get("summary") and len(str(metadata["summary"])) > 500:
+        warnings.append("Summary exceeds 500 characters")
+
+    return {
+        "passed": len(issues) == 0,
+        "issues":  issues,
+        "warnings": warnings,
+        "blocking_count": len(issues),
+        "warning_count": len(warnings),
+    }
+
+
+def build_final_markdown(transformed: str, metadata: dict) -> str:
+    """Inject final metadata into the document."""
+    # Strip any existing frontmatter
+    clean = re.sub(r"^---\n.*?\n---\n", "", transformed, flags=re.DOTALL).strip()
+    # Build YAML block
+    try:
+        yaml_block = yaml.dump(metadata, default_flow_style=False,
+                                allow_unicode=True, sort_keys=False)
+    except Exception:
+        yaml_block = str(metadata)
+    return f"---\n{yaml_block}---\n\n{clean}"
+
+
+# ─── SIDEBAR ──────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ KB Procedure Tool")
+    st.caption("Home Lending Knowledge Base")
+    st.divider()
+
+    # API Key
+    with st.expander("🔑 API Configuration", expanded=not st.session_state.api_key):
+        key_input = st.text_input(
+            "Anthropic API Key",
+            value=st.session_state.api_key,
+            type="password",
+            placeholder="sk-ant-...",
+            help="Your Anthropic API key. Stored in session only."
+        )
+        if key_input != st.session_state.api_key:
+            st.session_state.api_key = key_input
+            st.rerun()
+        if st.session_state.api_key:
+            st.success("API key set ✓", icon="✅")
+
+    st.divider()
+
+    # Batch Status
+    st.markdown('<p class="sec-label">Batch Status</p>', unsafe_allow_html=True)
+    docs = st.session_state.documents
+    if docs:
+        for name, doc in docs.items():
+            stages = ["extracted", "analyzed", "transformed", "metadata", "validated"]
+            done = sum(1 for s in stages if doc.get(s))
+            pct = done / len(stages)
+            is_active = name == st.session_state.active_doc
+            label = f"{'▶ ' if is_active else ''}{name[:28]}{'…' if len(name)>28 else ''}"
+            if st.button(label, key=f"sel_{name}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
+                st.session_state.active_doc = name
+                st.rerun()
+            st.progress(pct)
+    else:
+        st.caption("No documents loaded yet")
+
+    st.divider()
+
+    # Quick Stats
+    if docs:
+        total = len(docs)
+        fully_done = sum(1 for d in docs.values() if d.get("validated"))
+        st.metric("Documents", total)
+        st.metric("Fully Processed", fully_done)
+        sme_count = sum(
+            len(re.findall(r"\[SME ACTION REQUIRED", d.get("transformed", "")))
+            for d in docs.values()
+        )
+        if sme_count:
+            st.metric("SME Items Pending", sme_count, delta=None)
+
+    st.divider()
+    with st.popover("ℹ️ About this tool"):
+        st.markdown("""
+**Procedure Refactoring Tool** automates the conversion
+of legacy lending procedures to the KB authoring standard.
+
+**Pipeline Stages:**
+1. 📥 Extract text from Word/PDF
+2. 🔍 Analyse structure gaps  
+3. ✏️ Transform to authoring standard
+4. 🏷️ Generate & review metadata
+5. 🔗 Extract knowledge graph relationships
+6. ✅ Validate & export
+
+*Built on Claude Sonnet 4 · Streamlit 1.54*
+        """)
+
+
+# ─── MAIN CONTENT ─────────────────────────────────────────────────────────────────
+st.title("⚙️ Procedure Refactoring Tool")
+st.caption("AI-powered conversion of legacy lending procedures to KB authoring standards")
+
+tab_upload, tab_analyze, tab_transform, tab_metadata, tab_review, tab_export, tab_chat = st.tabs([
+    "📥 Upload", "🔍 Analyze", "✏️ Transform", "🏷️ Metadata", "👁️ Review", "📤 Export", "💬 AI Assistant"
+])
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 1 — UPLOAD
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_upload:
+    st.subheader("Upload Procedure Documents")
+
+    col_up, col_info = st.columns([3, 2])
+
+    with col_up:
+        uploaded = st.file_uploader(
+            "Drop files here — Word (.docx), PDF (.pdf), or Markdown (.md / .txt)",
+            type=["docx", "pdf", "txt", "md"],
+            accept_multiple_files=True,
+            label_visibility="visible",
+            help="Multiple files accepted. Each becomes an independent pipeline run."
+        )
+
+        if uploaded:
+            new_count = 0
+            for f in uploaded:
+                if f.name not in st.session_state.documents:
+                    with st.spinner(f"Extracting {f.name}…"):
+                        try:
+                            text = extract_text(f)
+                            st.session_state.documents[f.name] = {
+                                "raw_bytes": f.read(),
+                                "extracted": text,
+                                "file_type": f.name.split(".")[-1].lower(),
+                                "uploaded_at": datetime.now().isoformat(),
+                            }
+                            f.seek(0)
+                            new_count += 1
+                            if not st.session_state.active_doc:
+                                st.session_state.active_doc = f.name
+                        except Exception as e:
+                            st.error(f"Failed to extract {f.name}: {e}")
+
+            if new_count:
+                st.toast(f"✅ {new_count} document(s) loaded", icon="📥")
+                st.rerun()
+
+    with col_info:
+        st.markdown("""
+<div class="principle">
+<strong>Before uploading</strong><br>
+Gather all existing procedures in any format. The tool will:
+<ul style="margin:6px 0 0 16px; padding:0">
+<li>Extract and clean all text</li>
+<li>Identify structural gaps</li>
+<li>Apply all 10 authoring principles</li>
+<li>Generate complete YAML metadata</li>
+<li>Flag items needing SME review</li>
+</ul>
+</div>""", unsafe_allow_html=True)
+
+    # Document list
+    if st.session_state.documents:
+        st.divider()
+        st.markdown("### Loaded Documents")
+
+        for name, doc in st.session_state.documents.items():
+            with st.expander(f"📄 {name}", expanded=False):
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    st.caption(f"Type: {doc.get('file_type','?').upper()}")
+                    st.caption(f"Uploaded: {doc.get('uploaded_at','')[:16]}")
+                    word_count = len(doc.get("extracted","").split())
+                    st.caption(f"Word count: ~{word_count:,}")
+                with c2:
+                    stages = ["extracted","analyzed","transformed","metadata","validated"]
+                    labels = ["Extract","Analyze","Transform","Metadata","Validate"]
+                    html = ""
+                    for s, l in zip(stages, labels):
+                        state = "done" if doc.get(s) else "wait"
+                        html += badge_html(l, state)
+                    st.markdown(html, unsafe_allow_html=True)
+                with c3:
+                    if st.button("🗑 Remove", key=f"rm_{name}"):
+                        del st.session_state.documents[name]
+                        if st.session_state.active_doc == name:
+                            remaining = list(st.session_state.documents.keys())
+                            st.session_state.active_doc = remaining[0] if remaining else None
+                        st.rerun()
+
+                if doc.get("extracted"):
+                    with st.container(height=150):
+                        st.text(doc["extracted"][:1200] + "…")
+
+        st.divider()
+        st.markdown("### Run Full Pipeline on All Documents")
+        st.caption("Processes every document through all 5 stages sequentially.")
+
+        client = get_client()
+        if not client:
+            st.warning("⚠️ Set your Anthropic API key in the sidebar first.")
+        else:
+            if st.button("🚀 Run Full Pipeline (All Documents)", type="primary", use_container_width=True):
+                total_docs = len(st.session_state.documents)
+                overall_bar = st.progress(0, text="Starting pipeline…")
+                stage_labels = ["Structure Analysis", "Content Transformation",
+                                 "Metadata Generation", "Relationship Extraction", "Validation"]
+
+                for doc_idx, (name, doc) in enumerate(st.session_state.documents.items()):
+                    st.markdown(f"#### Processing: `{name}`")
+                    with st.status(f"Pipeline: {name}", expanded=True) as status_box:
+
+                        # Stage 1 – Analyze
+                        status_box.write("🔍 Stage 1: Structure Analysis…")
+                        try:
+                            analysis = run_structure_analysis(client, doc["extracted"])
+                            st.session_state.documents[name]["analyzed"] = analysis
+                        except Exception as e:
+                            status_box.write(f"❌ Analysis failed: {e}")
+                            continue
+
+                        # Stage 2 – Transform
+                        status_box.write("✏️ Stage 2: Content Transformation…")
+                        t_placeholder = st.empty()
+                        try:
+                            transformed = run_transformation(
+                                client, doc["extracted"], analysis, t_placeholder)
+                            st.session_state.documents[name]["transformed"] = transformed
+                        except Exception as e:
+                            status_box.write(f"❌ Transformation failed: {e}")
+                            continue
+
+                        # Stage 3 – Metadata
+                        status_box.write("🏷️ Stage 3: Metadata Generation…")
+                        try:
+                            metadata = run_metadata_generation(
+                                client, transformed, doc["extracted"])
+                            st.session_state.documents[name]["metadata"] = metadata
+                        except Exception as e:
+                            st.session_state.documents[name]["metadata"] = {}
+                            status_box.write(f"⚠️ Metadata partial: {e}")
+
+                        # Stage 4 – Relationships
+                        status_box.write("🔗 Stage 4: Relationship Extraction…")
+                        try:
+                            rels = run_relationship_extraction(
+                                client, transformed,
+                                st.session_state.documents[name].get("metadata", {}))
+                            st.session_state.documents[name]["relationships"] = rels
+                        except Exception:
+                            st.session_state.documents[name]["relationships"] = []
+
+                        # Stage 5 – Validate
+                        status_box.write("✅ Stage 5: Validation…")
+                        vresult = validate_procedure(
+                            transformed,
+                            st.session_state.documents[name].get("metadata", {}))
+                        st.session_state.documents[name]["validated"] = vresult
+                        status_box.update(
+                            label=f"✅ {name} complete",
+                            state="complete", expanded=False)
+
+                    overall_bar.progress(
+                        (doc_idx + 1) / total_docs,
+                        text=f"Processed {doc_idx+1}/{total_docs} documents"
+                    )
+
+                st.toast("🎉 Full pipeline complete!", icon="✅")
+                st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 2 — ANALYZE
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_analyze:
+    st.subheader("Structure Analysis")
+
+    active = st.session_state.active_doc
+    if not active or active not in st.session_state.documents:
+        st.info("Upload and select a document first.")
+        st.stop()
+
+    doc = st.session_state.documents[active]
+    st.markdown(f"**Active document:** `{active}`")
+
+    client = get_client()
+    if not client:
+        st.warning("Set your API key in the sidebar.")
+    else:
+        col_run, col_reset = st.columns([3, 1])
+        with col_run:
+            run_analysis = st.button(
+                "🔍 Analyse Structure",
+                type="primary",
+                disabled=not doc.get("extracted"),
+                use_container_width=True
+            )
+        with col_reset:
+            if st.button("↺ Clear", use_container_width=True) and doc.get("analyzed"):
+                st.session_state.documents[active].pop("analyzed", None)
+                st.rerun()
+
+        if run_analysis:
+            with st.status("Running structure analysis…", expanded=True) as s:
+                s.write("Sending document to Claude…")
+                try:
+                    analysis = run_structure_analysis(client, doc["extracted"])
+                    st.session_state.documents[active]["analyzed"] = analysis
+                    s.update(label="✅ Analysis complete", state="complete")
+                    st.rerun()
+                except Exception as e:
+                    s.update(label=f"❌ Failed: {e}", state="error")
+
+    if doc.get("analyzed"):
+        analysis = doc["analyzed"]
+
+        # Summary strip
+        qual = analysis.get("overall_quality", "?")
+        comp = analysis.get("conversion_complexity", "?")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Document Quality", qual.upper())
+        with col2:
+            st.metric("Conversion Complexity", comp.upper())
+        with col3:
+            found = sum(1 for v in analysis.get("section_mapping", {}).values() if v.get("found"))
+            st.metric("Sections Found", f"{found}/7")
+
+        st.divider()
+
+        # Section mapping table
+        st.markdown("### Section Mapping")
+        mapping = analysis.get("section_mapping", {})
+        rows = []
+        for section, info in mapping.items():
+            conf = info.get("confidence", "?")
+            conf_icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "⚪")
+            rows.append({
+                "Section": section.replace("_", " "),
+                "Found": "✅" if info.get("found") else "❌",
+                "Confidence": f"{conf_icon} {conf}",
+                "Notes": info.get("notes", "—"),
+            })
+
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        # Gaps & implicit decisions
+        col_l, col_r = st.columns(2)
+        with col_l:
+            gaps = analysis.get("gaps_identified", [])
+            st.markdown("#### ⚠️ Gaps Identified")
+            if gaps:
+                for g in gaps:
+                    st.markdown(f"- {g}")
+            else:
+                st.success("No major gaps found")
+
+        with col_r:
+            implicit = analysis.get("implicit_decisions", [])
+            st.markdown("#### 🔁 Implicit Decisions (to make explicit)")
+            if implicit:
+                for i in implicit:
+                    st.markdown(f"- {i}")
+            else:
+                st.success("No implicit decisions found")
+
+        st.markdown("#### 📜 Regulatory Mentions")
+        regs = analysis.get("regulatory_mentions", [])
+        if regs:
+            st.markdown(" ".join(f'<span class="tag tag-reg">{r}</span>' for r in regs),
+                        unsafe_allow_html=True)
+        else:
+            st.caption("None detected")
+
+        with st.expander("🔧 Raw Analysis JSON"):
+            st.json(analysis)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — TRANSFORM
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_transform:
+    st.subheader("Content Transformation")
+
+    active = st.session_state.active_doc
+    if not active:
+        st.info("Select a document first.")
+        st.stop()
+
+    doc = st.session_state.documents[active]
+    client = get_client()
+
+    if not doc.get("extracted"):
+        st.warning("Extract document text first (Upload tab).")
+    elif not client:
+        st.warning("Set your API key in the sidebar.")
+    else:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            if st.button("✏️ Run Content Transformation", type="primary",
+                         use_container_width=True):
+                analysis = doc.get("analyzed", {})
+                with st.spinner("Transforming…"):
+                    placeholder = st.empty()
+                    transformed = run_transformation(
+                        client, doc["extracted"], analysis, placeholder)
+                    st.session_state.documents[active]["transformed"] = transformed
+                    st.toast("Transformation complete!", icon="✅")
+                    st.rerun()
+        with c2:
+            if st.button("↺ Clear", use_container_width=True) and doc.get("transformed"):
+                st.session_state.documents[active].pop("transformed", None)
+                st.rerun()
+
+    if doc.get("transformed"):
+        transformed = doc["transformed"]
+
+        # Principle compliance strip
+        st.markdown("### Authoring Principle Compliance")
+        principles = {
+            "If/Then Logic": bool(re.search(r"\bif\b.+:\s*\n", transformed, re.I)),
+            "Regulatory Citations": bool(re.search(r"12 CFR|FNMA|FHLMC|Reg [A-Z]|FHA Handbook|VA Lenders", transformed)),
+            "H1 Title": bool(re.search(r"^# ", transformed, re.M)),
+            "H2 Sections": bool(re.search(r"^## ", transformed, re.M)),
+            "Purpose Stmt": bool(re.search(r"^## Purpose", transformed, re.M)),
+            "Scope Stmt": bool(re.search(r"^## Scope", transformed, re.M)),
+            "No Back-refs": not bool(re.search(r"as (mentioned|described) (above|earlier)", transformed, re.I)),
+            "QC Checklist": bool(re.search(r"Quality Control", transformed, re.I)),
+        }
+        cols = st.columns(len(principles))
+        for col, (label, ok) in zip(cols, principles.items()):
+            with col:
+                st.markdown(
+                    f'<div class="score-card"><div class="score-num">{"✓" if ok else "✕"}</div>'
+                    f'<div class="score-lbl">{label}</div></div>',
+                    unsafe_allow_html=True)
+
+        sme_count = len(re.findall(r"\[SME ACTION REQUIRED", transformed))
+        if sme_count:
+            st.warning(f"⚠️ {sme_count} SME action item(s) require human review before publishing",
+                       icon="🔔")
+
+        st.divider()
+        st.markdown("### Refactored Procedure")
+
+        view_mode = st.segmented_control(
+            "View", ["Rendered", "Raw Markdown"], default="Rendered")
+
+        with st.container(height=500):
+            if view_mode == "Rendered":
+                st.markdown(transformed)
+            else:
+                st.code(transformed, language="markdown")
+
+        # Download transformed only
+        st.download_button(
+            "⬇️ Download Transformed Markdown",
+            data=transformed,
+            file_name=f"{active.rsplit('.',1)[0]}_transformed.md",
+            mime="text/markdown"
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 4 — METADATA
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_metadata:
+    st.subheader("Metadata Management")
+
+    active = st.session_state.active_doc
+    if not active:
+        st.info("Select a document first.")
+        st.stop()
+
+    doc = st.session_state.documents[active]
+    client = get_client()
+
+    if not doc.get("transformed"):
+        st.warning("Run Content Transformation first.")
+    elif not client:
+        st.warning("Set your API key in the sidebar.")
+    else:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            if st.button("🏷️ Generate Metadata with AI", type="primary",
+                         use_container_width=True):
+                with st.spinner("Generating metadata…"):
+                    try:
+                        meta = run_metadata_generation(
+                            client, doc["transformed"], doc["extracted"])
+                        st.session_state.documents[active]["metadata"] = meta
+                        st.toast("Metadata generated!", icon="🏷️")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Metadata generation failed: {e}")
+
+    meta = doc.get("metadata", {})
+    if meta:
+        st.markdown("### Review & Edit Metadata")
+        st.caption("All fields use controlled vocabulary. Edit inline — changes auto-save to session.")
+
+        with st.form("metadata_form", border=False):
+            # Identity
+            st.markdown("#### 📋 Identity")
+            r1c1, r1c2, r1c3 = st.columns(3)
+            with r1c1:
+                meta["title"] = st.text_input("Title*", value=meta.get("title", ""))
+            with r1c2:
+                meta["procedure_id"] = st.text_input("Procedure ID*", value=meta.get("procedure_id", ""))
+            with r1c3:
+                meta["version"] = st.text_input("Version", value=meta.get("version", "1.0.0"))
+
+            r2c1, r2c2, r2c3 = st.columns(3)
+            with r2c1:
+                meta["status"] = st.selectbox(
+                    "Status", ["draft", "in_review", "approved", "published", "superseded"],
+                    index=["draft","in_review","approved","published","superseded"].index(
+                        meta.get("status","draft")))
+            with r2c2:
+                meta["owner"] = st.text_input("Owner / Department", value=meta.get("owner",""))
+            with r2c3:
+                meta["content_type"] = st.selectbox(
+                    "Content Type*", CV["content_type"],
+                    index=CV["content_type"].index(meta.get("content_type","procedure"))
+                    if meta.get("content_type") in CV["content_type"] else 0)
+
+            st.divider()
+
+            # Dates
+            st.markdown("#### 📅 Dates")
+            dc1, dc2, dc3 = st.columns(3)
+            with dc1:
+                eff = meta.get("effective_date", str(date.today()))
+                if isinstance(eff, str):
+                    try: eff = date.fromisoformat(eff)
+                    except: eff = date.today()
+                meta["effective_date"] = str(st.date_input("Effective Date", value=eff))
+            with dc2:
+                rev = meta.get("last_reviewed", str(date.today()))
+                if isinstance(rev, str):
+                    try: rev = date.fromisoformat(rev)
+                    except: rev = date.today()
+                meta["last_reviewed"] = str(st.date_input("Last Reviewed", value=rev))
+            with dc3:
+                nxt = meta.get("next_review_date", str(date.today()))
+                if isinstance(nxt, str):
+                    try: nxt = date.fromisoformat(nxt)
+                    except: nxt = date.today()
+                meta["next_review_date"] = str(st.date_input("Next Review Date", value=nxt))
+
+            st.divider()
+
+            # Taxonomy dimensions
+            st.markdown("#### 🏷️ Taxonomy Dimensions")
+            st.caption("Use the controlled vocabulary — deselect any incorrectly suggested values")
+
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                cur_product = meta.get("product", [])
+                if isinstance(cur_product, str): cur_product = [cur_product]
+                meta["product"] = st.multiselect("Product*", CV["product"],
+                    default=[v for v in cur_product if v in CV["product"]])
+
+                cur_loan = meta.get("loan_type", [])
+                if isinstance(cur_loan, str): cur_loan = [cur_loan]
+                meta["loan_type"] = st.multiselect("Loan Type*", CV["loan_type"],
+                    default=[v for v in cur_loan if v in CV["loan_type"]])
+
+                cur_stage = meta.get("stage", [])
+                if isinstance(cur_stage, str): cur_stage = [cur_stage]
+                meta["stage"] = st.multiselect("Lifecycle Stage*", CV["stage"],
+                    default=[v for v in cur_stage if v in CV["stage"]])
+
+            with tc2:
+                cur_role = meta.get("role", [])
+                if isinstance(cur_role, str): cur_role = [cur_role]
+                meta["role"] = st.multiselect("Functional Role*", CV["role"],
+                    default=[v for v in cur_role if v in CV["role"]])
+
+                cur_reg_auth = meta.get("regulatory_authority", [])
+                if isinstance(cur_reg_auth, str): cur_reg_auth = [cur_reg_auth]
+                meta["regulatory_authority"] = st.multiselect(
+                    "Regulatory Authority*", CV["regulatory"],
+                    default=[v for v in cur_reg_auth if v in CV["regulatory"]])
+
+                cur_topic = meta.get("topic", [])
+                if isinstance(cur_topic, str): cur_topic = [cur_topic]
+                meta["topic"] = st.multiselect("Topic Tags* (3-8)", CV["topic"],
+                    default=[v for v in cur_topic if v in CV["topic"]])
+
+            st.divider()
+
+            # Summary
+            st.markdown("#### 📝 AI-Optimized Summary")
+            summary = st.text_area(
+                "Summary (≤500 chars)*",
+                value=meta.get("summary", ""),
+                height=80,
+                help="Include key nouns, action verbs, product/loan specifics, and synonyms"
+            )
+            char_count = len(summary)
+            col_sum, col_char = st.columns([5, 1])
+            with col_sum:
+                meta["summary"] = summary
+            with col_char:
+                color = "red" if char_count > 500 else "green"
+                st.markdown(f"<span style='color:{color}; font-size:12px'>{char_count}/500</span>",
+                            unsafe_allow_html=True)
+
+            # Regulatory references table
+            st.divider()
+            st.markdown("#### ⚖️ Regulatory References")
+            reg_refs = meta.get("regulatory_references", [])
+            if not isinstance(reg_refs, list): reg_refs = []
+            reg_df = [{"citation": r.get("citation",""), "description": r.get("description","")}
+                      for r in reg_refs] if reg_refs else [{"citation":"","description":""}]
+
+            edited_refs = st.data_editor(
+                reg_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "citation": st.column_config.TextColumn("Citation", width=200),
+                    "description": st.column_config.TextColumn("Description", width=400),
+                },
+                key="reg_refs_editor"
+            )
+            meta["regulatory_references"] = [r for r in edited_refs if r.get("citation")]
+
+            # MISMO references
+            st.markdown("#### 🗂️ MISMO References")
+            mismo_refs = meta.get("mismo_references", [])
+            if not isinstance(mismo_refs, list): mismo_refs = []
+            mismo_df = [{"container": r.get("container",""), "data_point": r.get("data_point","")}
+                        for r in mismo_refs] if mismo_refs else [{"container":"","data_point":""}]
+
+            edited_mismo = st.data_editor(
+                mismo_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "container": st.column_config.SelectboxColumn(
+                        "MISMO Container", width=180,
+                        options=["INCOME","ASSET","LIABILITY","PROPERTY","LOAN",
+                                 "BORROWER","EMPLOYMENT","CREDIT","CLOSING"]),
+                    "data_point": st.column_config.TextColumn("Data Point", width=300),
+                },
+                key="mismo_editor"
+            )
+            meta["mismo_references"] = [r for r in edited_mismo if r.get("container")]
+
+            # SME action items
+            sme_items_in_doc = re.findall(
+                r"\[SME ACTION REQUIRED: ([^\]]+)\]", doc.get("transformed",""))
+            if sme_items_in_doc:
+                st.divider()
+                st.markdown(f"#### 🔔 SME Action Items ({len(sme_items_in_doc)} pending)")
+                for item in sme_items_in_doc:
+                    st.markdown(f"- ⚠️ {item}")
+
+            submitted = st.form_submit_button("💾 Save Metadata", type="primary",
+                                               use_container_width=True)
+            if submitted:
+                st.session_state.documents[active]["metadata"] = meta
+                st.toast("Metadata saved ✓", icon="💾")
+
+        # YAML preview
+        with st.expander("📄 YAML Preview"):
+            try:
+                yaml_str = yaml.dump(meta, default_flow_style=False,
+                                      allow_unicode=True, sort_keys=False)
+                st.code(yaml_str, language="yaml")
+            except Exception as e:
+                st.error(f"YAML error: {e}")
+
+        # Relationship graph
+        if doc.get("relationships"):
+            st.divider()
+            st.markdown("### 🔗 Knowledge Graph Relationships")
+            rels = doc["relationships"]
+            rel_rows = [{"Subject": r.get("subject",""), "Predicate": r.get("predicate",""),
+                          "Object": r.get("object",""), "Source": r.get("source","")}
+                         for r in rels]
+            st.dataframe(rel_rows, use_container_width=True, hide_index=True)
+            if client:
+                if st.button("↺ Re-extract Relationships"):
+                    with st.spinner("Extracting…"):
+                        rels = run_relationship_extraction(
+                            client, doc.get("transformed",""), meta)
+                        st.session_state.documents[active]["relationships"] = rels
+                        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 5 — REVIEW
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_review:
+    st.subheader("Review & Validation")
+
+    active = st.session_state.active_doc
+    if not active:
+        st.info("Select a document first.")
+        st.stop()
+
+    doc = st.session_state.documents[active]
+
+    if not doc.get("transformed"):
+        st.warning("Run transformation first.")
+        st.stop()
+
+    # Run validation
+    if not doc.get("validated") and doc.get("metadata"):
+        vr = validate_procedure(doc["transformed"], doc["metadata"])
+        st.session_state.documents[active]["validated"] = vr
+
+    vr = doc.get("validated", {})
+
+    # Quality scores
+    if doc.get("metadata"):
+        scores = compute_quality_score(doc)
+        st.markdown("### Quality Scorecard")
+        score_cols = st.columns(6)
+        score_labels = {
+            "overall": "Overall", "structure": "Structure",
+            "decision_logic": "If/Then Logic", "regulatory_coverage": "Regulatory",
+            "metadata": "Metadata", "self_contained": "Self-Contained"
+        }
+        for col, (key, label) in zip(score_cols, score_labels.items()):
+            val = scores.get(key, 0)
+            color = "#4ade80" if val >= 80 else "#facc15" if val >= 60 else "#f87171"
+            with col:
+                st.markdown(
+                    f'<div class="score-card"><div class="score-num" style="color:{color}">{val}</div>'
+                    f'<div class="score-lbl">{label}</div></div>',
+                    unsafe_allow_html=True)
+
+        st.divider()
+
+    # Validation checklist
+    if vr:
+        st.markdown("### Validation Checklist")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### ❌ Blocking Issues")
+            if vr.get("issues"):
+                for issue in vr["issues"]:
+                    st.error(issue, icon="🚫")
+            else:
+                st.success("No blocking issues — ready to publish")
+        with c2:
+            st.markdown("#### ⚠️ Warnings")
+            if vr.get("warnings"):
+                for w in vr["warnings"]:
+                    st.warning(w, icon="⚠️")
+            else:
+                st.success("No warnings")
+
+        if vr.get("passed"):
+            st.success("✅ Procedure passes all validation checks", icon="✅")
+        else:
+            st.error(f"❌ {vr['blocking_count']} blocking issue(s) must be resolved before publishing")
+
+    st.divider()
+
+    # Side-by-side comparison
+    st.markdown("### Side-by-Side Comparison")
+    view_opt = st.radio("View mode", ["Rendered", "Raw Markdown", "Diff"],
+                         horizontal=True)
+
+    if view_opt == "Diff":
+        orig_lines = doc.get("extracted", "").splitlines()
+        new_lines = doc.get("transformed", "").splitlines()
+        differ = []
+        import difflib
+        for line in difflib.unified_diff(orig_lines, new_lines,
+                                          fromfile="Original", tofile="Transformed", lineterm=""):
+            if line.startswith("+") and not line.startswith("+++"):
+                differ.append(f'<div class="diff-add">{line[1:]}</div>')
+            elif line.startswith("-") and not line.startswith("---"):
+                differ.append(f'<div class="diff-rem">{line[1:]}</div>')
+            elif line.startswith("@@"):
+                differ.append(f'<div class="diff-ctx">{line}</div>')
+        with st.container(height=550):
+            st.markdown("\n".join(differ[:400]), unsafe_allow_html=True)
+    else:
+        orig_col, new_col = st.columns(2)
+        with orig_col:
+            st.markdown("**Original**")
+            with st.container(height=500):
+                if view_opt == "Rendered":
+                    st.markdown(doc.get("extracted", "")[:5000])
+                else:
+                    st.code(doc.get("extracted", "")[:5000], language="markdown")
+        with new_col:
+            st.markdown("**Refactored**")
+            with st.container(height=500):
+                if view_opt == "Rendered":
+                    st.markdown(doc.get("transformed", ""))
+                else:
+                    st.code(doc.get("transformed", ""), language="markdown")
+
+    # SME sign-off
+    st.divider()
+    st.markdown("### SME Sign-off")
+    with st.form("signoff_form"):
+        sme_name = st.text_input("SME Name")
+        sme_dept = st.text_input("Department")
+        sme_notes = st.text_area("Review Notes (optional)", height=80)
+        sme_confirmed = st.checkbox(
+            "I confirm this procedure is accurate and all SME action items are resolved")
+        if st.form_submit_button("✅ Submit SME Approval", type="primary"):
+            if sme_confirmed and sme_name:
+                st.session_state.documents[active]["sme_signoff"] = {
+                    "name": sme_name, "department": sme_dept,
+                    "notes": sme_notes, "timestamp": datetime.now().isoformat()
+                }
+                st.toast(f"✅ Signed off by {sme_name}", icon="✅")
+            else:
+                st.error("Provide your name and check the confirmation box.")
+
+    if doc.get("sme_signoff"):
+        so = doc["sme_signoff"]
+        st.success(f"✅ Approved by {so['name']} ({so['department']}) at {so['timestamp'][:16]}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — EXPORT
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_export:
+    st.subheader("Export")
+
+    docs = st.session_state.documents
+    if not docs:
+        st.info("No documents processed yet.")
+        st.stop()
+
+    ready = {n: d for n, d in docs.items() if d.get("transformed")}
+
+    if not ready:
+        st.warning("No documents have been transformed yet.")
+        st.stop()
+
+    # Export options
+    st.markdown("### Export Options")
+    export_format = st.segmented_control(
+        "Format", ["Markdown (.md)", "YAML Frontmatter Only", "Metadata JSON"],
+        default="Markdown (.md)")
+
+    include_relationships = st.toggle("Include relationship triples", value=True)
+    include_validation = st.toggle("Include validation report", value=True)
+
+    st.divider()
+    st.markdown("### Available Documents")
+
+    for name, doc in ready.items():
+        with st.expander(f"📄 {name}", expanded=True):
+            vr = doc.get("validated", {})
+            meta = doc.get("metadata", {})
+
+            # Status row
+            cols = st.columns([3, 1, 1, 2])
+            with cols[0]:
+                st.caption(meta.get("title", name))
+            with cols[1]:
+                st.markdown(badge_html("Valid" if vr.get("passed") else "Issues",
+                                       "done" if vr.get("passed") else "error"),
+                            unsafe_allow_html=True)
+            with cols[2]:
+                if doc.get("sme_signoff"):
+                    st.markdown(badge_html("SME ✓", "done"), unsafe_allow_html=True)
+                else:
+                    st.markdown(badge_html("Pending", "wait"), unsafe_allow_html=True)
+
+            with cols[3]:
+                base_name = name.rsplit(".", 1)[0]
+
+                if export_format == "Markdown (.md)":
+                    final_md = build_final_markdown(
+                        doc["transformed"], meta)
+                    if include_relationships and doc.get("relationships"):
+                        rels_yaml = yaml.dump(
+                            {"relationships": doc["relationships"]},
+                            default_flow_style=False)
+                        final_md += f"\n\n---\n\n## Appendix: Knowledge Graph Relationships\n\n```yaml\n{rels_yaml}```"
+                    if include_validation and vr:
+                        final_md += f"\n\n## Validation Report\n\n**Status:** {'PASSED' if vr.get('passed') else 'FAILED'}\n\n"
+                        for issue in vr.get("issues", []):
+                            final_md += f"- ❌ {issue}\n"
+                        for warn in vr.get("warnings", []):
+                            final_md += f"- ⚠️ {warn}\n"
+                    st.download_button(
+                        "⬇️ Download .md",
+                        data=final_md,
+                        file_name=f"{base_name}_kb.md",
+                        mime="text/markdown",
+                        key=f"dl_md_{name}"
+                    )
+
+                elif export_format == "YAML Frontmatter Only":
+                    yaml_str = yaml.dump(meta, default_flow_style=False,
+                                          allow_unicode=True, sort_keys=False)
+                    st.download_button(
+                        "⬇️ Download .yaml",
+                        data=yaml_str,
+                        file_name=f"{base_name}_metadata.yaml",
+                        mime="text/yaml",
+                        key=f"dl_yaml_{name}"
+                    )
+
+                else:  # JSON
+                    export_obj = {
+                        "metadata": meta,
+                        "validation": vr,
+                        "relationships": doc.get("relationships", []),
+                        "sme_signoff": doc.get("sme_signoff"),
+                        "pipeline_run": {"timestamp": doc.get("uploaded_at")}
+                    }
+                    st.download_button(
+                        "⬇️ Download .json",
+                        data=json.dumps(export_obj, indent=2, default=str),
+                        file_name=f"{base_name}_metadata.json",
+                        mime="application/json",
+                        key=f"dl_json_{name}"
+                    )
+
+    # Batch export
+    if len(ready) > 1:
+        st.divider()
+        st.markdown("### Batch Export")
+        if st.button("📦 Export All as ZIP", type="primary", use_container_width=True):
+            import zipfile
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for name, doc in ready.items():
+                    base = name.rsplit(".", 1)[0]
+                    if export_format == "Markdown (.md)":
+                        content = build_final_markdown(doc["transformed"], doc.get("metadata", {}))
+                        zf.writestr(f"{base}_kb.md", content)
+                    elif export_format == "YAML Frontmatter Only":
+                        content = yaml.dump(doc.get("metadata", {}),
+                                             default_flow_style=False, allow_unicode=True)
+                        zf.writestr(f"{base}_metadata.yaml", content)
+                    else:
+                        content = json.dumps({
+                            "metadata": doc.get("metadata", {}),
+                            "relationships": doc.get("relationships", [])
+                        }, indent=2, default=str)
+                        zf.writestr(f"{base}_metadata.json", content)
+            zip_buf.seek(0)
+            st.download_button(
+                "⬇️ Download ZIP",
+                data=zip_buf.getvalue(),
+                file_name="kb_procedures_export.zip",
+                mime="application/zip"
+            )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 7 — AI ASSISTANT
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_chat:
+    st.subheader("AI Assistant")
+    st.caption("Ask questions, request revisions, or get authoring guidance for the active document")
+
+    active = st.session_state.active_doc
+    doc = st.session_state.documents.get(active, {})
+    client = get_client()
+
+    # Build context summary for the assistant
+    ctx_parts = ["You are an expert knowledge base assistant for a mortgage lending organization."]
+    ctx_parts.append("You help SMEs refine AI-optimized procedures to meet authoring standards.")
+    if doc.get("transformed"):
+        ctx_parts.append(f"\nACTIVE DOCUMENT: {active}")
+        ctx_parts.append(f"TRANSFORMED CONTENT (first 3000 chars):\n{doc['transformed'][:3000]}")
+    if doc.get("metadata"):
+        ctx_parts.append(f"\nMETADATA SUMMARY: {json.dumps({k: v for k, v in doc['metadata'].items() if k in ['title','product','loan_type','stage','role','summary']}, indent=2)}")
+    if doc.get("validated"):
+        vr = doc["validated"]
+        ctx_parts.append(f"\nVALIDATION: {'PASSED' if vr.get('passed') else 'FAILED'} — Issues: {vr.get('issues')}")
+    system_ctx = "\n".join(ctx_parts)
+
+    # Render chat history
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Suggestion pills
+    if not st.session_state.chat_history:
+        st.markdown("**Suggested prompts:**")
+        suggestions = [
+            "Improve the if/then logic in the Procedure Steps section",
+            "Make all sections fully self-contained",
+            "Add regulatory citations for every requirement",
+            "Write a better AI-optimized summary for the metadata",
+            "Identify sections that need worked examples",
+            "Review the scope — is it too broad or too narrow?",
+        ]
+        sel = st.pills("Quick start", suggestions, selection_mode="single")
+        if sel:
+            st.session_state.chat_history.append({"role": "user", "content": sel})
+            st.rerun()
+
+    # Chat input
+    if prompt := st.chat_input("Ask about the procedure, request edits, or get authoring guidance…"):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            if not client:
+                response = "⚠️ Please set your Anthropic API key in the sidebar."
+                st.markdown(response)
+            else:
+                placeholder = st.empty()
+                messages = [{"role": m["role"], "content": m["content"]}
+                             for m in st.session_state.chat_history]
+                response = stream_claude(client, system_ctx,
+                                         messages[-1]["content"], placeholder)
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+        # Offer to apply suggestions
+        if any(kw in response.lower() for kw in ["here is", "here's", "updated", "revised", "rewritten"]):
+            if doc.get("transformed") and st.button("Apply this revision to the document?"):
+                # Extract the markdown code block if present
+                code_match = re.search(r"```(?:markdown)?\n(.*?)```", response, re.DOTALL)
+                if code_match:
+                    st.session_state.documents[active]["transformed"] = code_match.group(1)
+                    st.toast("Revision applied!", icon="✅")
+                    st.rerun()
+
+    if st.session_state.chat_history:
+        if st.button("🗑 Clear Chat"):
+            st.session_state.chat_history = []
+            st.rerun()
